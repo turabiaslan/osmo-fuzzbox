@@ -1,0 +1,170 @@
+==> Building localhost/baseband_fuzzer:v1  [IMSI=001010000000001 ALGO=comp128v1]
+podman build \
+    --build-arg TEST_IMSI="001010000000001" \
+    --build-arg TEST_KI="00000000000000000000000000000000"     \
+    --build-arg TEST_ALGO="comp128v1" \
+    -t "localhost/baseband_fuzzer:v1" \
+    .
+STEP 1/47: FROM fedora:44
+STEP 2/47: LABEL org.opencontainers.image.title="baseband-fuzzer"
+--> Using cache be27ad1c858dd948223979cd9740a68939f2d35e99e50730be7ba0b6d4b1d20d
+--> be27ad1c858d
+STEP 3/47: LABEL org.opencontainers.image.description="2G/GSM baseband fuzzing pipeline — Osmocom + Boofuzz L3/MM hook"
+--> Using cache f5991550af0c7821f46b0b00c38e8214012435ffa12cccfaa49b3a0424686508
+--> f5991550af0c
+STEP 4/47: LABEL org.opencontainers.image.version="1.0.0"
+--> Using cache e13d30ca430154a1d4189571a90af486b84d7fa54bd5a7a79c065dd2e37516a9
+--> e13d30ca4301
+STEP 5/47: RUN dnf -y update && dnf -y install                 gcc gcc-c++ make autoconf automake libtool         pkgconf-pkg-config git patch python3                 libtalloc-devel         libusb1-devel         pcsc-lite-devel         gnutls-devel         libmnl-devel         lksctp-tools-devel         sqlite-devel         libdbi-devel         libdbi-dbd-sqlite         libpcap-devel         c-ares-devel         liburing-devel         perl                 uhd         uhd-devel         fftw-devel         boost-devel         uhd-firmware                 hackrf                 iproute         procps-ng         nc         sqlite     && dnf clean all
+--> Using cache bcbe8042dd24388ebc2e8d5568eac7c11aed77979eaa77c36bf22a68cea3dbe8
+--> bcbe8042dd24
+STEP 6/47: ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
+--> Using cache 5e6b144f680a90c89826646ab33324c7b1311109347a645ce6e3a49c9ec8ea8e
+--> 5e6b144f680a
+STEP 7/47: ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64
+--> Using cache 4c32f82c60b47a7eb2a0329ba0d23be2f4c8190d7c8b12dafe0b9d3e40f6964a
+--> 4c32f82c60b4
+STEP 8/47: ENV GIT_TERMINAL_PROMPT=0
+--> Using cache 3737d7b09c28a9c61aa80d89706e74525c0cff6f800a61209f48b544b4eb71fc
+--> 3737d7b09c28
+STEP 9/47: RUN echo '/usr/local/lib'   >  /etc/ld.so.conf.d/local.conf &&     echo '/usr/local/lib64' >> /etc/ld.so.conf.d/local.conf &&     ldconfig
+--> Using cache 1dbaa6aed0cb6b59846caf9e97c0a67479126d41893bfe60a7ede2614772b311
+--> 1dbaa6aed0cb
+STEP 10/47: WORKDIR /build
+--> Using cache 5ca0c5dc190a53380c55754dfd60ffec38580e00829e978ddd8ce810c0b81f0c
+--> 5ca0c5dc190a
+STEP 11/47: RUN git clone         https://github.com/osmocom/libosmocore.git &&     cd libosmocore &&     autoreconf -fi &&     ./configure --disable-pcsc &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache dfa671993ce27321aa870bbe96d05a754f2d1e28ec2e9a0fb07f5676e84ac745
+--> dfa671993ce2
+STEP 12/47: RUN git clone         https://github.com/osmocom/libosmo-netif.git &&     cd libosmo-netif &&     autoreconf -fi &&     ./configure &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache ba4221f9dc85b5d3bef89547171a8dbd9df4db36ad47c19964659fa0ef3c7e35
+--> ba4221f9dc85
+STEP 13/47: RUN git clone --branch 2.1.0         https://github.com/osmocom/libosmo-abis.git &&     cd libosmo-abis &&     autoreconf -fi &&     HELP="$(./configure --help 2>&1)" &&     EXTRA="" &&     echo "$HELP" | grep -q -- '--disable-ortp'  && EXTRA="$EXTRA --disable-ortp"  || true &&     echo "$HELP" | grep -q -- '--disable-dahdi' && EXTRA="$EXTRA --disable-dahdi" || true &&     ./configure $EXTRA &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache 411bc58f5dc4e7ff5b9707df55a2d15e36bb30e1aa66e1111f93c480ae57986e
+--> 411bc58f5dc4
+STEP 14/47: RUN mkdir -p /usr/local/include/osmocom/trau &&     printf '%s\n'       '#pragma once'       '/* oRTP stub — compiled without oRTP support (no ortp-devel available) */'       '#include <stdint.h>'       'struct osmo_rtp_socket { int fd; };'       'typedef struct osmo_rtp_socket osmo_rtp_socket;'       'struct osmo_rtp_ops { void *rx_cb; };'       'static inline int  osmo_rtp_init(void *ctx)                  { return 0; }'       'static inline void osmo_rtp_set_ops(void *s, void *o)        { (void)s; (void)o; }'       'static inline int  osmo_rtp_socket_create(void *c, int pt, void *ops) { return -1; }'       > /usr/local/include/osmocom/trau/osmo_ortp.h
+--> Using cache 39a5c56964b36675c2ace4281040adeb071fa8c2e1dfdcd1911d69b43e84195f
+--> 39a5c56964b3
+STEP 15/47: RUN git clone --branch 1.8.0 --depth 1         https://github.com/osmocom/libosmo-sccp.git &&     cd libosmo-sccp &&     autoreconf -fi &&     ./configure &&     make -j"$(nproc)" && make install && ldconfig &&     for pcdir in /usr/local/lib/pkgconfig /usr/local/lib64/pkgconfig; do         if [ -f "$pcdir/libosmo-sigtran.pc" ] &&            [ ! -f "$pcdir/libosmo-sccp.pc" ]; then             ln -sf "$pcdir/libosmo-sigtran.pc" "$pcdir/libosmo-sccp.pc" &&             echo "Created $pcdir/libosmo-sccp.pc -> libosmo-sigtran.pc";         fi;     done
+--> Using cache 5f95aee0df55c33cb303e8504427bcc027f59bb2ca03de6f56d089e9fadd7edf
+--> 5f95aee0df55
+STEP 16/47: RUN git clone         https://github.com/osmocom/libsmpp34.git &&     cd libsmpp34 &&     autoreconf -fi &&     ./configure &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache 175547b347806eda021d5d51dd620d068fafa858f62af77e4d5889304e447ac0
+--> 175547b34780
+STEP 17/47: RUN git clone         https://github.com/osmocom/osmo-mgw.git &&     cd osmo-mgw &&     autoreconf -fi &&     ORTP_FLAG="$(./configure --help 2>&1 |                  grep -q -- '--disable-ortp' &&                  echo '--disable-ortp' || true)" &&     ./configure ${ORTP_FLAG} &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache 2a1930f6d8974df49fec985c55cbd9f516e83145163ed89dd450253a0f349cd9
+--> 2a1930f6d897
+STEP 18/47: RUN git clone         https://github.com/osmocom/osmo-hlr.git &&     cd osmo-hlr &&     autoreconf -fi &&     ./configure &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache ef473c5a76cd60f574fba2d741208d4912df2d5c1b468953e6f81adf40e25187
+--> ef473c5a76cd
+STEP 19/47: COPY patches/ /build/patches/
+--> Using cache fb9e52743e1228626bd2231ae7d02b1406b97bf5fd4337dacd93a04006799209
+--> fb9e52743e12
+STEP 20/47: RUN git clone --branch 1.11.0         https://github.com/osmocom/osmo-bsc.git &&     cd osmo-bsc &&     sed -i '/SUBDIRS/ s/ ipaccess//' src/Makefile.am &&     python3 /build/patches/bsc_e1_patch.py &&     autoreconf -fi &&     ./configure &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache 255bedae5e40842c804587dd40208aa08d6aeb6b4c354c80c74bbf937dd904be
+--> 255bedae5e40
+STEP 21/47: RUN git clone --branch 1.11.0         https://github.com/osmocom/osmo-msc.git &&     cd osmo-msc &&     autoreconf -fi
+--> Using cache 94db1698b21a0cb6bb3cfef5aa19175c14294ee781426f7d34d29b948ecc6c04
+--> 94db1698b21a
+STEP 22/47: COPY hook/fuzzer_hook.c       /build/osmo-msc/src/libmsc/fuzzer_hook.c
+--> Using cache 6eebc5d4ea75a1dc721434007baa5730e24ff0f8627e8612108c08ceefab2030
+--> 6eebc5d4ea75
+STEP 23/47: COPY hook/fuzzer_hook.h       /build/osmo-msc/src/libmsc/fuzzer_hook.h
+--> Using cache ed23c4b5a9e65347a1abd3836f49a66126e5ecba6516e25bf1ecbe5e7fd4d05b
+--> ed23c4b5a9e6
+STEP 24/47: COPY hook/apply_hook.py       /build/osmo-msc/apply_hook.py
+--> Using cache 3271d7a9b365024dc1e4b2187c55a09217baf5c0ce607ab59c53b9389e55d6af
+--> 3271d7a9b365
+STEP 25/47: RUN echo "=== AUTH TX candidates in libmsc ===" &&     grep -rn "auth.*req\|tx.*auth\|mm_tx_auth\|gsm48.*auth"         /build/osmo-msc/src/libmsc/ --include="*.c"         | grep -v "^\s*//" | grep -i "req\|send\|tx" | head -40 || true &&     echo "=== IDENTITY TX candidates in libmsc ===" &&     grep -rn "id.*req\|identity.*req\|tx.*id\|mm_tx_id"         /build/osmo-msc/src/libmsc/ --include="*.c"         | grep -v "^\s*//" | head -30 || true
+--> Using cache c1b6ccb27587df40671baaa6e416f7b013f9dca8f7f6ce998b27214547fd9124
+--> c1b6ccb27587
+STEP 26/47: RUN cd osmo-msc &&     python3 apply_hook.py &&     ./configure &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache a8588c2aa3971094de1e36a597a28d039d12f80dbaaac208c67f91d691511e8f
+--> a8588c2aa397
+STEP 27/47: RUN git clone         https://github.com/osmocom/osmo-trx.git &&     cd osmo-trx &&     autoreconf -fi &&     ./configure --with-uhd &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache 479c96e6011840f2c704d7760cb33a8701b111236ad3f71f81cbe507ac3ad1f7
+--> 479c96e60118
+STEP 28/47: RUN git clone         https://github.com/osmocom/osmo-bts.git &&     cd osmo-bts &&     autoreconf -fi &&     HELP="$(./configure --help 2>&1)" &&     EXTRA="--enable-trx" &&     echo "$HELP" | grep -q -- '--disable-ortp' && EXTRA="$EXTRA --disable-ortp" || true &&     ./configure $EXTRA &&     make -j"$(nproc)" && make install && ldconfig
+--> Using cache 0a256bc6bff15915470f416aeec35db37e97d912695f862ee414ddd93108fa7e
+--> 0a256bc6bff1
+STEP 29/47: RUN mkdir -p /etc/osmocom /var/log/osmocom /var/lib/osmocom
+--> Using cache 7475deb2861a565b4ba02de393a23efe46d2a68e90c5ef75cc3178630ece8bc6
+--> 7475deb2861a
+STEP 30/47: COPY configs/osmo-stp.cfg /etc/osmocom/osmo-stp.cfg
+--> Using cache ecacf30f2f17f462477b37c035a00bb509b30fcc5cbbff870c443ea8b0545806
+--> ecacf30f2f17
+STEP 31/47: COPY configs/osmo-hlr.cfg /etc/osmocom/osmo-hlr.cfg
+--> Using cache c9d0c2e85cced5fa8609acc841f93c879c6add409290a166ba32022da7570f58
+--> c9d0c2e85cce
+STEP 32/47: COPY configs/osmo-mgw.cfg /etc/osmocom/osmo-mgw.cfg
+--> Using cache 8a753279f863c475b741e6138473a2cef361af3046a9f5a6915399096a691e60
+--> 8a753279f863
+STEP 33/47: COPY configs/osmo-msc.cfg /etc/osmocom/osmo-msc.cfg
+--> Using cache 8c90ad0a51265aa7cb6fc934591f5ad15a368c88b067eec92ddf9589527959a4
+--> 8c90ad0a5126
+STEP 34/47: COPY configs/osmo-bsc.cfg /etc/osmocom/osmo-bsc.cfg
+--> b0efe77f37d3
+STEP 35/47: COPY configs/osmo-bts.cfg /etc/osmocom/osmo-bts.cfg
+--> 2f3fd131804d
+STEP 36/47: COPY configs/osmo-trx.cfg /etc/osmocom/osmo-trx.cfg
+--> 83422e1c6bcc
+STEP 37/47: COPY provision_hlr.sh /usr/local/bin/provision_hlr.sh
+--> 00c6eb669984
+STEP 38/47: COPY entrypoint.sh    /usr/local/bin/entrypoint.sh
+--> 6c4f8f9709ff
+STEP 39/47: RUN chmod +x /usr/local/bin/provision_hlr.sh              /usr/local/bin/entrypoint.sh
+--> 59d68a185f77
+STEP 40/47: RUN ls /usr/share/uhd/images/usrp_b200_fw.hex
+/usr/share/uhd/images/usrp_b200_fw.hex
+--> 516df3470d73
+STEP 41/47: RUN for d in osmo-msc osmo-bsc osmo-bts-trx osmo-trx-uhd              osmo-hlr osmo-mgw osmo-stp; do         p="$(command -v "$d" 2>/dev/null)" &&         echo "OK: $d -> $p" ||         { echo "MISSING: $d"; exit 1; };     done
+OK: osmo-msc -> /usr/local/bin/osmo-msc
+OK: osmo-bsc -> /usr/local/bin/osmo-bsc
+OK: osmo-bts-trx -> /usr/local/bin/osmo-bts-trx
+OK: osmo-trx-uhd -> /usr/local/bin/osmo-trx-uhd
+OK: osmo-hlr -> /usr/local/bin/osmo-hlr
+OK: osmo-mgw -> /usr/local/bin/osmo-mgw
+OK: osmo-stp -> /usr/local/bin/osmo-stp
+--> 787bba4a9ec3
+STEP 42/47: ARG TEST_IMSI=001010000000001
+--> 4450ee614e4a
+STEP 43/47: ARG TEST_KI=00000000000000000000000000000000
+--> fae2b84e9b55
+STEP 44/47: ARG TEST_ALGO=comp128v1
+--> 92689509fd86
+STEP 45/47: RUN /usr/local/bin/provision_hlr.sh "${TEST_IMSI}" "${TEST_KI}" "${TEST_ALGO}"
+[provision_hlr] Starting osmo-hlr to initialise schema …
+<0000> hlr.c:817 hlr starting
+[1;31m<0001> db.c:600 using database: /var/lib/osmocom/hlr.db[0;m
+[1;31m<0001> db.c:668 Missing database tables detected; Bootstrapping database '/var/lib/osmocom/hlr.db'[0;m
+[1;31m<0001> db.c:679 Database '/var/lib/osmocom/hlr.db' has HLR DB schema version 7[0;m
+<0009> telnet_interface.c:88 Available via telnet 127.0.0.1 4258
+[38;5;33m<0010> control_if.c:1026 CTRL at 127.0.0.1 4259[0;m
+<0000> hlr.c:737 Terminating due to signal=15
+full talloc report on 'OsmoHLR' (total   4652 bytes in  14 blocks)
+    telnet_connection              contains      1 bytes in   1 blocks (ref 0) 0x5d67a30
+    struct sched_vty_opts          contains     72 bytes in   1 blocks (ref 0) 0x5d31330
+    utils.c:386                    contains    494 bytes in   1 blocks (ref 0) 0x5c552d0
+    utils.c:386                    contains    192 bytes in   1 blocks (ref 0) 0x5c551a0
+    dgsm                           contains     40 bytes in   2 blocks (ref 0) 0x5c2b5a0
+        struct osmo_mslookup_client    contains     40 bytes in   1 blocks (ref 0) 0x5d9c8f0
+    struct hlr                     contains   3852 bytes in   6 blocks (ref 0) 0x5c2bd70
+        struct ctrl_handle             contains     88 bytes in   1 blocks (ref 0) 0x5d9bbe0
+        127.0.0.1                      contains     10 bytes in   1 blocks (ref 0) 0x5d3a030
+        /var/lib/osmocom/hlr.db        contains     24 bytes in   1 blocks (ref 0) 0x5d39950
+        mdns.osmocom.org               contains     17 bytes in   1 blocks (ref 0) 0x5c2bc00
+        mdns.osmocom.org               contains     17 bytes in   1 blocks (ref 0) 0x5c2bc80
+    msgb                           contains      0 bytes in   1 blocks (ref 0) 0x5c2aca0
+full talloc report on 'null_context' (total     24 bytes in   2 blocks)
+    struct lookup_helper           contains     24 bytes in   1 blocks (ref 0) 0x5d9bb60
+[provision_hlr] Provisioning IMSI=001010000000001 algo=comp128v1 …
+[provision_hlr] Done.  IMSI=001010000000001  algo=comp128v1  DB=/var/lib/osmocom/hlr.db
+--> b11df945ea9d
+STEP 46/47: EXPOSE 27017/tcp
+--> 51a139d1b35f
+STEP 47/47: ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+COMMIT localhost/baseband_fuzzer:v1
+--> 5240228eef0a
+Successfully tagged localhost/baseband_fuzzer:v1
+5240228eef0aa82139b2c25fd8b11ac4e7f6d32947d02740c93d4b709d4dc74e
+==> Build complete: localhost/baseband_fuzzer:v1
