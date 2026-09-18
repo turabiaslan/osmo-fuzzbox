@@ -83,18 +83,24 @@ WORKDIR /build
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 1. libosmocore  ─ foundational; everything links it
+# PINNED to 1.12.0: minimum required by libosmo-abis 2.1.0.
+#   osmo-bsc 1.11.0 requires ≥ 1.9.0, osmo-bts 1.8.0 requires ≥ 1.10.0,
+#   libosmo-abis 2.1.0 requires ≥ 1.12.0.  1.12.0 satisfies all three.
+#   OML/NM definitions (gsm_12_21.h, abis_nm.h) live here.
 # NOTE: no --depth flag — shallow clones suppress git tags, causing
-# `git describe` to fail and pkg-config Version to become UNKNOWN,
-# breaking every downstream configure that checks `libosmocore >= x.y`.
-RUN git clone \
+# `git describe` to fail and pkg-config Version to become UNKNOWN.
+RUN git clone --branch 1.12.0 \
         https://github.com/osmocom/libosmocore.git && \
     cd libosmocore && \
     autoreconf -fi && \
     ./configure --disable-pcsc && \
     make -j"$(nproc)" && make install && ldconfig
 
-# 2. libosmo-netif  ─ network primitives; libosmo-abis now depends on this
-RUN git clone \
+# 2. libosmo-netif  ─ network primitives; libosmo-abis depends on this
+# PINNED to 1.7.0: minimum required by libosmo-abis 2.1.0.
+#   osmo-bsc 1.11.0 requires ≥ 1.4.0, osmo-bts 1.8.0 requires ≥ 1.5.0,
+#   libosmo-abis 2.1.0 requires ≥ 1.7.0.  1.7.0 satisfies all three.
+RUN git clone --branch 1.7.0 \
         https://github.com/osmocom/libosmo-netif.git && \
     cd libosmo-netif && \
     autoreconf -fi && \
@@ -119,20 +125,109 @@ RUN git clone --branch 2.1.0 \
 
 # 3b. libosmo-trau stub ─ libosmo-trau (provides osmocom/trau/osmo_ortp.h) has
 #     no GitHub mirror and gitea.osmocom.org requires auth for archive downloads.
-#     Create a minimal stub header so the #include compiles.  osmo-bts will be
-#     configured with --disable-ortp so no oRTP functions are ever called.
+#     Create a comprehensive stub so osmo-bts compiles without oRTP.
+#     All RTP functions are no-ops — voice calls are not needed for fuzzing.
 RUN mkdir -p /usr/local/include/osmocom/trau && \
-    printf '%s\n' \
-      '#pragma once' \
-      '/* oRTP stub — compiled without oRTP support (no ortp-devel available) */' \
-      '#include <stdint.h>' \
-      'struct osmo_rtp_socket { int fd; };' \
-      'typedef struct osmo_rtp_socket osmo_rtp_socket;' \
-      'struct osmo_rtp_ops { void *rx_cb; };' \
-      'static inline int  osmo_rtp_init(void *ctx)                  { return 0; }' \
-      'static inline void osmo_rtp_set_ops(void *s, void *o)        { (void)s; (void)o; }' \
-      'static inline int  osmo_rtp_socket_create(void *c, int pt, void *ops) { return -1; }' \
-      > /usr/local/include/osmocom/trau/osmo_ortp.h
+    cat > /usr/local/include/osmocom/trau/osmo_ortp.h << 'STUB_EOF'
+#pragma once
+/* oRTP stub — compiled without oRTP support (no ortp-devel available)
+ * All functions are no-ops; osmo-bts compiles but RTP is non-functional.
+ * This is fine for baseband fuzzing (we don't need voice calls). */
+#include <stdint.h>
+#include <string.h>
+#include <arpa/inet.h>
+
+/* Flags */
+#define OSMO_RTP_F_POLL        0x01
+
+/* Parameter IDs for osmo_rtp_socket_set_param */
+#define OSMO_RTP_P_JITBUF      1
+#define OSMO_RTP_P_JIT_ADAP    2
+
+/* GSM speech: 160 samples per 20ms frame at 8kHz */
+#define GSM_RTP_DURATION       160
+
+/* RTP socket structure */
+struct osmo_rtp_socket {
+    int fd;
+    void *priv;
+    uint32_t rx_user_ts;
+    uint32_t tx_user_ts;
+    void (*rx_cb)(struct osmo_rtp_socket *rs, const uint8_t *rtp_pl,
+                  unsigned int rtp_pl_len, uint16_t seq_number,
+                  uint32_t timestamp, int marker);
+};
+
+/* Callback ops */
+struct osmo_rtp_ops {
+    void (*rx_cb)(struct osmo_rtp_socket *, const uint8_t *, unsigned int,
+                  uint16_t, uint32_t, int);
+};
+
+/* Stub implementations — all return error or no-op */
+static inline int  osmo_rtp_init(void *ctx) { (void)ctx; return 0; }
+static inline void osmo_rtp_set_ops(void *s, void *o) { (void)s; (void)o; }
+static inline struct osmo_rtp_socket *osmo_rtp_socket_create(void *c, unsigned int flags) {
+    (void)c; (void)flags; return NULL;
+}
+static inline int  osmo_rtp_socket_bind(void *rs, const char *ip, int port) {
+    (void)rs; (void)ip; (void)port; return -1;
+}
+static inline int  osmo_rtp_socket_connect(void *rs, const char *ip, uint16_t port) {
+    (void)rs; (void)ip; (void)port; return -1;
+}
+static inline int  osmo_rtp_socket_free(void *rs) { (void)rs; return 0; }
+static inline int  osmo_rtp_socket_set_param(void *rs, int param, int val) {
+    (void)rs; (void)param; (void)val; return 0;
+}
+static inline int  osmo_rtp_socket_set_pt(void *rs, int pt) {
+    (void)rs; (void)pt; return 0;
+}
+static inline int  osmo_rtp_socket_set_dscp(void *rs, int dscp) {
+    (void)rs; (void)dscp; return 0;
+}
+static inline int  osmo_rtp_socket_set_priority(void *rs, int prio) {
+    (void)rs; (void)prio; return 0;
+}
+static inline int  osmo_rtp_socket_stats(void *rs, uint32_t *tx_pkts, uint32_t *tx_bytes,
+                                          uint32_t *rx_pkts, uint32_t *rx_bytes,
+                                          uint32_t *packets_lost, uint32_t *arrival_jitter) {
+    (void)rs;
+    if(tx_pkts)*tx_pkts=0; if(tx_bytes)*tx_bytes=0;
+    if(rx_pkts)*rx_pkts=0; if(rx_bytes)*rx_bytes=0;
+    if(packets_lost)*packets_lost=0; if(arrival_jitter)*arrival_jitter=0;
+    return 0;
+}
+static inline void osmo_rtp_socket_log_stats(void *rs, int subsys, int level,
+                                              const char *pfx) {
+    (void)rs; (void)subsys; (void)level; (void)pfx;
+}
+static inline int  osmo_rtp_get_bound_ip_port(void *rs, uint32_t *ip, int *port) {
+    (void)rs; if(ip)*ip=0; if(port)*port=0; return -1;
+}
+static inline int  osmo_rtp_set_source_desc(void *rs, const char *cname,
+                                             const char *name, const char *email,
+                                             const char *phone, const char *loc,
+                                             const char *tool, const char *note) {
+    (void)rs; (void)cname; (void)name; (void)email;
+    (void)phone; (void)loc; (void)tool; (void)note;
+    return 0;
+}
+static inline int  osmo_rtp_send_frame_ext(void *rs, const uint8_t *payload,
+                                            unsigned int len, unsigned int duration,
+                                            int marker) {
+    (void)rs; (void)payload; (void)len; (void)duration; (void)marker;
+    return -1;
+}
+static inline int  osmo_rtp_socket_poll(void *rs) {
+    (void)rs; return -1;
+}
+static inline int  osmo_rtp_skipped_frame(void *rs, unsigned int duration) {
+    (void)rs; (void)duration; return -1;
+}
+STUB_EOF
+
+
 
 # 4. libosmo-sccp  ─ provides  osmo-stp daemon  +  libosmo-sigtran
 #                    (A-interface SCCP/M3UA for BSC ↔ MSC)
@@ -170,7 +265,7 @@ RUN git clone \
 # --disable-ortp: present in older releases, absent in newer ones.
 # The sub-shell queries ./configure --help so the flag is only passed
 # when the build system actually accepts it.
-RUN git clone \
+RUN git clone --branch 1.12.0 \
         https://github.com/osmocom/osmo-mgw.git && \
     cd osmo-mgw && \
     autoreconf -fi && \
@@ -181,7 +276,7 @@ RUN git clone \
     make -j"$(nproc)" && make install && ldconfig
 
 # 7. osmo-hlr  ─ provides libosmo-gsupclient + HLR daemon (holds Ki)
-RUN git clone \
+RUN git clone --branch 1.7.0 \
         https://github.com/osmocom/osmo-hlr.git && \
     cd osmo-hlr && \
     autoreconf -fi && \
@@ -217,6 +312,8 @@ RUN git clone --branch 1.11.0 \
 # apply_hook.py modifies gsm_04_08.c and src/libmsc/Makefile.am in-place.
 COPY hook/fuzzer_hook.c       /build/osmo-msc/src/libmsc/fuzzer_hook.c
 COPY hook/fuzzer_hook.h       /build/osmo-msc/src/libmsc/fuzzer_hook.h
+COPY hook/mutator.c           /build/osmo-msc/src/libmsc/mutator.c
+COPY hook/mutator.h           /build/osmo-msc/src/libmsc/mutator.h
 COPY hook/apply_hook.py       /build/osmo-msc/apply_hook.py
 
 # ── Diagnostic: dump auth/identity TX function signatures so apply_hook.py
@@ -236,7 +333,7 @@ RUN cd osmo-msc && \
     make -j"$(nproc)" && make install && ldconfig
 
 # 10. osmo-trx  ─ TRX transceiver; links UHD to drive the B210
-RUN git clone \
+RUN git clone --branch 1.6.0 \
         https://github.com/osmocom/osmo-trx.git && \
     cd osmo-trx && \
     autoreconf -fi && \
@@ -245,17 +342,29 @@ RUN git clone \
 
 # 11. osmo-bts  (osmo-bts-trx backend)
 #     links: core, abis, netif
-#     Built without oRTP: the osmo_ortp.h stub satisfies the include but any
-#     oRTP call sites are compiled out via --disable-ortp (if supported).
-RUN git clone \
+#     oRTP functions stubbed; voice path unused for fuzzing.
+#     PINNED to 1.8.0: NM state machine fixes for TRX compatibility with BSC 1.11.0.
+#       1.7.0 had broken oml_tx_attr_resp() that didn't handle TRX NM attributes,
+#       causing BSC to never enable TRX in its NM state machine.
+#     Step A: strip deprecated-access macros from libosmocore's logging.h
+#     Step B: build with -Wno-error for remaining minor warnings.
+RUN sed -i \
+        -e 's/^#define OSMO_DEPRECATED_OUTSIDE_LIBOSMOCORE_LOG_TARGET.*/#define OSMO_DEPRECATED_OUTSIDE_LIBOSMOCORE_LOG_TARGET/' \
+        -e 's/^#define OSMO_DEPRECATED_OUTSIDE(.*/#define OSMO_DEPRECATED_OUTSIDE(x)/' \
+        /usr/local/include/osmocom/core/logging.h && \
+    git clone --branch 1.8.0 \
         https://github.com/osmocom/osmo-bts.git && \
     cd osmo-bts && \
+    sed -i 's/ contrib//' Makefile.am && \
     autoreconf -fi && \
     HELP="$(./configure --help 2>&1)" && \
     EXTRA="--enable-trx" && \
     echo "$HELP" | grep -q -- '--disable-ortp' && EXTRA="$EXTRA --disable-ortp" || true && \
     ./configure $EXTRA && \
-    make -j"$(nproc)" && make install && ldconfig
+    make -j"$(nproc)" CFLAGS="-g -O2 -std=gnu11 -DGSM_RTP_FRAME_DURATION_MS=20 -Wno-error -Wno-implicit-function-declaration -Wno-int-conversion -Wno-deprecated-declarations -Wno-incompatible-pointer-types" && \
+    make install && ldconfig
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 4 — Config files, runtime directories, helper scripts
@@ -268,6 +377,7 @@ COPY configs/osmo-mgw.cfg /etc/osmocom/osmo-mgw.cfg
 COPY configs/osmo-msc.cfg /etc/osmocom/osmo-msc.cfg
 COPY configs/osmo-bsc.cfg /etc/osmocom/osmo-bsc.cfg
 COPY configs/osmo-bts.cfg /etc/osmocom/osmo-bts.cfg
+COPY configs/osmo-bts-virtual.cfg /etc/osmocom/osmo-bts-virtual.cfg
 COPY configs/osmo-trx.cfg /etc/osmocom/osmo-trx.cfg
 
 COPY provision_hlr.sh /usr/local/bin/provision_hlr.sh

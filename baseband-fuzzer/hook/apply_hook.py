@@ -262,44 +262,44 @@ def patch_makefile(content):
         if lib_prefix in l:
             print(f"  {lineno}: {l}")
 
-    # ── Add fuzzer_hook.c to <lib_prefix>_SOURCES ────────────────────────────
-    if "fuzzer_hook.c" not in modified:
-        source_patterns = [
-            # Format 1: SOURCES = \<NL><indent>first.c
-            (rf"({re.escape(sources_var)}\s*=\s*\\\s*\n)([ \t]+)",
-             r"\1\2fuzzer_hook.c \\\n\2"),
-            # Format 2: SOURCES = first.c \<NL>…   (inline start)
-            (rf"({re.escape(sources_var)}\s*=\s*)(\S+\.c)",
-             r"\1fuzzer_hook.c \\\n\t\2"),
-        ]
+    # ── Add fuzzer_hook.c and mutator.c to <lib_prefix>_SOURCES ──────────────
+    for src_file in ["fuzzer_hook.c", "mutator.c"]:
+      if src_file not in modified:
+            source_patterns = [
+                # Format 1: SOURCES = \<NL><indent>first.c
+                (rf"({re.escape(sources_var)}\s*=\s*\\\s*\n)([ \t]+)",
+                 rf"\1\2{src_file} \\\n\2"),
+                # Format 2: SOURCES = first.c \<NL>…   (inline start)
+                (rf"({re.escape(sources_var)}\s*=\s*)(\S+\.c)",
+                 rf"\1{src_file} \\\n\t\2"),
+            ]
 
-        for pat, repl in source_patterns:
-            candidate = re.sub(pat, repl, modified, count=1)
-            if candidate != modified:
-                modified = candidate
-                print(f"[apply_hook] ✓ Added fuzzer_hook.c via pattern match")
-                break
-        else:
+            for pat, repl in source_patterns:
+                candidate = re.sub(pat, repl, modified, count=1)
+                if candidate != modified:
+                    modified = candidate
+                    print(f"[apply_hook] ✓ Added {src_file} via pattern match")
+                    break
+            else:
             # Fallback: insert a line right after the SOURCES = ... line
             # (works regardless of multi-line format)
-            def insert_after_sources(m2):
-                line = m2.group(0)
-                # If line ends with backslash, insert after it on next line
-                if line.rstrip().endswith("\\"):
-                    return line + "\tfuzzer_hook.c \\\n"
-                return line + " fuzzer_hook.c"
+                def insert_after_sources(m2):
+                    line = m2.group(0)
+                    if line.rstrip().endswith("\\"):
+                        return line + f"\t{src_file} \\\n"
+                    return line + f" {src_file}"
 
-            candidate = re.sub(
-                rf"{re.escape(sources_var)}\s*=\s*[^\n]*",
-                insert_after_sources,
-                modified,
-                count=1,
-            )
-            if candidate != modified:
-                modified = candidate
-                print(f"[apply_hook] ✓ Added fuzzer_hook.c via inline-insert fallback")
-            else:
-                sys.exit(f"[apply_hook] FATAL: could not add fuzzer_hook.c to {sources_var}")
+                candidate = re.sub(
+                    rf"{re.escape(sources_var)}\s*=\s*[^\n]*",
+                    insert_after_sources,
+                    modified,
+                    count=1,
+                )
+                if candidate != modified:
+                    modified = candidate
+                    print(f"[apply_hook] ✓ Added {src_file} via inline-insert fallback")
+                else:
+                    sys.exit(f"[apply_hook] FATAL: could not add {src_file} to {sources_var}")
 
     # ── Add -lpthread to LDADD / LIBADD ─────────────────────────────────────
     for libadd_var in ldadd_vars:
@@ -411,8 +411,13 @@ def main():
     # sccp_user.c — bypass fatal role-not-set check
     patch_sccp_role_check()
 
+    # NOTE: mutator_init() uses __attribute__((constructor))
+    # so it runs automatically when libmsc loads — no msc_main.c patch needed.
+    print("[apply_hook] In-process fuzzer will auto-start via GCC constructor")
+
     print("[apply_hook] Hook injection complete.")
 
 
 if __name__ == "__main__":
     main()
+

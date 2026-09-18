@@ -1,265 +1,215 @@
 /*
- * fuzzer_hook.c — L3/MM fuzzer hook compiled into osmo-msc libmsc
+ * fuzzer_hook.c — In-process baseband fuzzer hook for osmo-msc.
  *
- * This file is injected into the osmo-msc source tree by apply_hook.py
- * before the build.  It is NOT a standalone shared library; it is compiled
- * directly into libmsc.la and therefore has full access to internal symbols.
+ * Intercepts outgoing GSM 04.08 Mobility Management messages and mutates
+ * them in-place using the mutator engine.  The mutated messages are then
+ * transmitted over the air interface to the target phone's baseband.
  *
- * ─── Wire protocol ───────────────────────────────────────────────────────────
+ * CRITICAL DESIGN NOTES:
  *
- *   Both directions: [u16 big-endian length][payload bytes]
+ *  1. Hook placement:  apply_hook.py injects the call to fuzzer_hook_mm_tx()
+ *     immediately BEFORE the final msc_a_tx_dtap_to_i() (or equivalent submit
+ *     function).  At that point the msgb is fully encoded — all IEs, lengths,
+ *     and TLVs are finalized.  The RSL/L2 wrapping happens AFTER the submit
+ *     call, so it will read the (now mutated) msgb length correctly.
  *
- *   Hook → Boofuzz (two consecutive frames per invocation):
- *     Frame 1: "READY <state_tag>"   e.g. "READY auth_req"  (ASCII, no NUL)
- *     Frame 2: original message bytes (the un-mutated L3 payload)
+ *  2. msgb length sync:  Truncation/Extension strategies change L3 payload
+ *     length.  We adjust the msgb via msgb_put()/msgb_trim() so the RSL
+ *     layer sees the correct total length.
  *
- *   Boofuzz → Hook (one frame):
- *     Frame 1: mutated bytes to substitute into the msgb
+ *  3. Phased fuzzing:  The first FUZZ_SKIP messages pass through unfuzzed
+ *     to let the phone complete registration (LU Accept must arrive clean
+ *     at least once).  After that, all MM messages are fuzz-eligible.
  *
- * ─── Threading model ─────────────────────────────────────────────────────────
+ *  4. Protocol filtering:  Only MM messages (PD=0x05) are fuzzed.
+ *     Message type is extracted with (l3[1] & 0x3F) to mask sequence bits.
  *
- *   osmo-msc runs its core state machine in a single-threaded osmo_select
- *   main loop.  The blocking recv() in this hook therefore pauses the entire
- *   MSC event loop for the duration of each fuzzer round-trip.  This is
- *   intentional: it serialises mutations and avoids race conditions with
- *   retransmission timers.  A Ctrl-C or fuzzer disconnect restores normal
- *   operation (g_client_fd is reset and future calls pass through unchanged).
+ * Environment variables (set in Makefile/entrypoint):
+ *   FUZZ_RATE  — % of messages to mutate (0-100, default 100)
+ *   FUZZ_SEED  — PRNG seed for deterministic replay (default: random)
+ *   FUZZ_SKIP  — # of initial messages to pass through clean (default: 10)
+ *   FUZZ_LOG   — mutation log path (default: /var/log/osmocom/fuzzer.log)
  *
- *   A mutex guards the TCP fd against unexpected re-entrance (e.g. if the
- *   build system ever enables threads in libmsc).
- *
- * Copyright (C) 2026  Open Source Guard Fuzzing Pipeline
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * Copyright (c) 2026 OpenSrcGuard Lab.  All rights reserved.
  */
 
-#include "fuzzer_hook.h"
-
-#include <osmocom/core/logging.h>
-#include <osmocom/core/msgb.h>
-
-#include <arpa/inet.h>
-#include <errno.h>
-#include <netinet/in.h>
-#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
-/* ─── Configuration ──────────────────────────────────────────────────────── */
+#include <osmocom/core/msgb.h>
+#include <osmocom/core/logging.h>
+#include <osmocom/gsm/protocol/gsm_04_08.h>
 
-#define FUZZER_HOOK_PORT    27017
-#define FUZZER_HOOK_BACKLOG 1
-#define MAX_PAYLOAD_LEN     4096   /* hard cap on received mutated bytes */
+#include "mutator.h"
 
-/* ─── Module-local state ─────────────────────────────────────────────────── */
+/* ─── 3GPP TS 04.08 §10.2 — Protocol Discriminator ──────────────────────── */
+#define GSM48_PDISC_MM  0x05
 
-static int             g_srv_fd      = -1;
-static int             g_client_fd   = -1;
-static int             g_initialized = 0;
-static pthread_mutex_t g_lock        = PTHREAD_MUTEX_INITIALIZER;
+/* ─── Module state ───────────────────────────────────────────────────────── */
 
-/* ─── Internal helpers ───────────────────────────────────────────────────── */
+static int g_initialized = 0;
+static unsigned long g_total_msgs = 0;
+static unsigned long g_total_fuzzed = 0;
+static unsigned long g_total_skipped = 0;
+static int g_fuzz_skip = 10;   /* skip first N messages for registration */
 
-static int hook_init(void)
+/* GSM 04.08 MM message type names (for logging) */
+static const char *mm_msg_name(uint8_t msg_type)
 {
-	struct sockaddr_in addr;
-	int opt = 1;
+	switch (msg_type) {
+	case 0x01: return "CM_SERV_ACCEPT";
+	case 0x02: return "TMSI_REALLOC_CMD";
+	case 0x04: return "LU_REJECT";
+	case 0x08: return "LU_ACCEPT";
+	case 0x11: return "AUTH_REJECT";
+	case 0x12: return "AUTH_REQUEST";
+	case 0x14: return "AUTH_RESPONSE";
+	case 0x18: return "IDENTITY_REQUEST";
+	case 0x19: return "IDENTITY_RESPONSE";
+	case 0x21: return "CM_SERV_REJECT";
+	case 0x29: return "MM_INFORMATION";
+	case 0x30: return "ABORT";
+	case 0x31: return "MM_STATUS";
+	default:   return "UNKNOWN";
+	}
+}
 
-	g_srv_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (g_srv_fd < 0) {
-		LOGP(DLGLOBAL, LOGL_ERROR,
-		     "fuzzer_hook: socket() failed: %s\n", strerror(errno));
-		return -1;
+/* ─── Constructor: initialise mutator when osmo-msc loads ────────────────── */
+
+static void __attribute__((constructor)) fuzzer_hook_autostart(void)
+{
+	const char *env;
+
+	fprintf(stderr,
+		"fuzzer_hook: in-process baseband fuzzer loading...\n");
+
+	/* FUZZ_SKIP: how many initial messages to pass through clean */
+	env = getenv("FUZZ_SKIP");
+	if (env && *env)
+		g_fuzz_skip = atoi(env);
+
+	if (mutator_init() < 0) {
+		fprintf(stderr,
+			"fuzzer_hook: WARNING: mutator_init() failed; "
+			"messages will pass through unfuzzed\n");
+		return;
 	}
 
-	setsockopt(g_srv_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family      = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY;
-	addr.sin_port        = htons(FUZZER_HOOK_PORT);
-
-	if (bind(g_srv_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		LOGP(DLGLOBAL, LOGL_ERROR,
-		     "fuzzer_hook: bind() on port %d failed: %s\n",
-		     FUZZER_HOOK_PORT, strerror(errno));
-		close(g_srv_fd);
-		g_srv_fd = -1;
-		return -1;
-	}
-
-	if (listen(g_srv_fd, FUZZER_HOOK_BACKLOG) < 0) {
-		LOGP(DLGLOBAL, LOGL_ERROR,
-		     "fuzzer_hook: listen() failed: %s\n", strerror(errno));
-		close(g_srv_fd);
-		g_srv_fd = -1;
-		return -1;
-	}
-
-	LOGP(DLGLOBAL, LOGL_NOTICE,
-	     "fuzzer_hook: TCP server listening on 0.0.0.0:%d\n",
-	     FUZZER_HOOK_PORT);
 	g_initialized = 1;
-	return 0;
+	fprintf(stderr,
+		"fuzzer_hook: ready — skip=%d then mutating MM messages in-place\n",
+		g_fuzz_skip);
 }
 
-/* Accept a client or return existing fd.  Blocks until Boofuzz connects. */
-static int hook_ensure_client(void)
+/* ─── Destructor: clean shutdown ─────────────────────────────────────────── */
+
+static void __attribute__((destructor)) fuzzer_hook_shutdown(void)
 {
-	if (g_client_fd >= 0)
-		return g_client_fd;
-
-	LOGP(DLGLOBAL, LOGL_NOTICE,
-	     "fuzzer_hook: waiting for Boofuzz connection on port %d …\n",
-	     FUZZER_HOOK_PORT);
-
-	g_client_fd = accept(g_srv_fd, NULL, NULL);
-	if (g_client_fd < 0) {
-		LOGP(DLGLOBAL, LOGL_ERROR,
-		     "fuzzer_hook: accept() failed: %s\n", strerror(errno));
-		g_client_fd = -1;
-		return -1;
-	}
-
-	LOGP(DLGLOBAL, LOGL_NOTICE, "fuzzer_hook: Boofuzz connected\n");
-	return g_client_fd;
+	fprintf(stderr,
+		"fuzzer_hook: shutting down (total=%lu, fuzzed=%lu, skipped=%lu)\n",
+		g_total_msgs, g_total_fuzzed, g_total_skipped);
+	mutator_shutdown();
 }
 
-static void hook_disconnect(void)
-{
-	if (g_client_fd >= 0) {
-		close(g_client_fd);
-		g_client_fd = -1;
-	}
-	LOGP(DLGLOBAL, LOGL_NOTICE,
-	     "fuzzer_hook: Boofuzz disconnected; hook will wait for reconnect\n");
-}
+/* ─── Public hook: called from gsm_04_08.c on every outgoing MM message ── */
 
 /*
- * Send one length-prefixed frame.
- * Returns 0 on success, -1 on error.
+ * fuzzer_hook_mm_tx — Intercept and possibly mutate an outgoing MM message.
+ *
+ * Called by the patched gsm_04_08.c immediately BEFORE the final submit
+ * function (msc_a_tx_dtap_to_i or equivalent).  At this point:
+ *   - The msgb L3 payload is fully encoded (all IEs, TLVs complete)
+ *   - RSL/L2 wrapping has NOT happened yet (happens inside submit)
+ *   - Mutating msgb_l3(msg) here will reach the baseband
+ *
+ * msg:       the message buffer (L3 payload starts at msgb_l3())
+ * state_tag: descriptive string from the call site (for logging)
+ *
+ * Returns 0 always (message is sent regardless of mutation outcome).
  */
-static int send_frame(int fd, const uint8_t *data, uint16_t len)
-{
-	uint16_t nlen = htons(len);
-
-	if (send(fd, &nlen, sizeof(nlen), MSG_NOSIGNAL) != sizeof(nlen))
-		return -1;
-	if (len == 0)
-		return 0;
-	if (send(fd, data, len, MSG_NOSIGNAL) != (ssize_t)len)
-		return -1;
-	return 0;
-}
-
-/*
- * Receive one length-prefixed frame into buf (max MAX_PAYLOAD_LEN bytes).
- * Returns 0 on success, -1 on error or oversized frame.
- */
-static int recv_frame(int fd, uint8_t *buf, uint16_t *out_len)
-{
-	uint16_t nlen;
-	ssize_t  r;
-
-	r = recv(fd, &nlen, sizeof(nlen), MSG_WAITALL);
-	if (r != sizeof(nlen))
-		return -1;
-
-	*out_len = ntohs(nlen);
-	if (*out_len == 0) {
-		return 0;          /* zero-length frame is valid (pass-through) */
-	}
-	if (*out_len > MAX_PAYLOAD_LEN) {
-		LOGP(DLGLOBAL, LOGL_ERROR,
-		     "fuzzer_hook: received oversized frame (%u bytes > %d)\n",
-		     *out_len, MAX_PAYLOAD_LEN);
-		return -1;
-	}
-
-	r = recv(fd, buf, *out_len, MSG_WAITALL);
-	if (r != (ssize_t)*out_len)
-		return -1;
-
-	return 0;
-}
-
-/* ─── Public API ─────────────────────────────────────────────────────────── */
-
 int fuzzer_hook_mm_tx(struct msgb *msg, const char *state_tag)
 {
-	uint8_t  mutated[MAX_PAYLOAD_LEN];
-	uint16_t mut_len = 0;
-	int      fd;
-	int      rc = 0;   /* 0 = no mutation (pass-through), caller still sends */
-	char     ready_str[64];
+	uint8_t  *l3;
+	uint16_t  l3_len;
+	uint8_t   pd;
+	uint8_t   msg_type;
 
-	if (!msg || !state_tag)
+	if (!g_initialized)
+		return 0;  /* pass through if mutator failed to init */
+
+	l3 = msgb_l3(msg);
+	l3_len = msgb_l3len(msg);
+
+	if (!l3 || l3_len < 2)
+		return 0;  /* too short to be a valid L3 message */
+
+	/* ── Issue #5: Proper L3 header decoding ──────────────────────────── */
+	/* Byte 0: protocol discriminator (lower nibble) + skip/TI (upper)
+	 * Byte 1: message type — lower 6 bits significant for MM,
+	 *         upper 2 bits may contain send sequence number */
+	pd = l3[0] & 0x0F;
+	msg_type = l3[1] & 0x3F;
+
+	/* Only fuzz Mobility Management messages (PD=5).
+	 * CC (PD=3), SS (PD=11), SMS (PD=9) are left alone. */
+	if (pd != GSM48_PDISC_MM)
 		return 0;
 
-	pthread_mutex_lock(&g_lock);
+	g_total_msgs++;
 
-	/* Lazy initialisation of the TCP server socket */
-	if (!g_initialized) {
-		if (hook_init() < 0)
-			goto out;
+	/* ── Type whitelist — NEVER fuzz these, connection depends on them ── */
+	/* 0x12 = Authentication Request: phone must complete auth to register
+	 * 0x08 = Location Updating Accept: completes registration, assigns TMSI
+	 * Without these, the phone never attaches and we have nothing to fuzz. */
+	if (msg_type == 0x12 || msg_type == 0x08) {
+		LOGP(DLGLOBAL, LOGL_INFO,
+		     "fuzzer_hook: WHITELIST %s (0x%02x) — essential for registration\n",
+		     mm_msg_name(msg_type), msg_type);
+		return 0;
 	}
 
-	/* If no client is connected, pass the message through unchanged */
-	fd = hook_ensure_client();
-	if (fd < 0)
-		goto out;
-
-	/* ── Frame 1 up: "READY <state_tag>" ── */
-	snprintf(ready_str, sizeof(ready_str), "READY %s", state_tag);
-	if (send_frame(fd, (uint8_t *)ready_str, (uint16_t)strlen(ready_str)) < 0) {
-		hook_disconnect();
-		goto out;
+	/* ── Phased fuzzing — let phone register first ───────────────────── */
+	/* Skip the first N MM messages so the initial registration flow
+	 * completes fully before any fuzzing begins. */
+	if ((long)g_total_msgs <= g_fuzz_skip) {
+		g_total_skipped++;
+		LOGP(DLGLOBAL, LOGL_INFO,
+		     "fuzzer_hook: PASS-THROUGH %s (0x%02x) [%lu/%d skip phase]\n",
+		     mm_msg_name(msg_type), msg_type,
+		     g_total_msgs, g_fuzz_skip);
+		return 0;
 	}
 
-	/* ── Frame 2 up: original message bytes as context ── */
-	if (msg->len > 0 &&
-	    send_frame(fd, msg->data, (uint16_t)msg->len) < 0) {
-		hook_disconnect();
-		goto out;
-	}
+	/* ── Issue #2: Mutate in-place with msgb length sync ─────────────── */
+	uint16_t new_len = l3_len;
+	uint16_t maxlen = msg->data + msg->data_len - l3;  /* available buffer */
 
-	/* ── Frame 1 down: mutated bytes from Boofuzz ── */
-	if (recv_frame(fd, mutated, &mut_len) < 0) {
-		hook_disconnect();
-		goto out;
-	}
+	int was_fuzzed = mutator_fuzz(l3, &new_len, maxlen, msg_type);
 
-	/* ── Overwrite msgb payload (bounds-checked) ── */
-	if (mut_len > 0) {
-		/*
-		 * Strategy: overwrite the existing bytes in-place up to the
-		 * original length, then adjust msg->len and msg->tail to
-		 * reflect the (possibly shorter or longer) mutated payload.
-		 *
-		 * We only expand if the buffer has headroom; otherwise we
-		 * silently truncate to the available space.  The BTS/TRX
-		 * layer will reject frames that are too short for the L3
-		 * header anyway, which is itself a useful fuzzing outcome.
-		 */
-		uint16_t avail = (uint16_t)(msgb_tailroom(msg) + msg->len);
-		uint16_t use   = (mut_len <= avail) ? mut_len : avail;
+	if (was_fuzzed) {
+		g_total_fuzzed++;
 
-		memcpy(msg->data, mutated, use);
-		msg->len  = use;
-		msg->tail = msg->data + use;
+		/* Adjust msgb length if mutator changed it (truncate/extend).
+		 * This is CRITICAL: the RSL layer reads msgb_length() to
+		 * determine the L3 payload size.  Without this update,
+		 * truncation/extension mutations would be silently dropped
+		 * or padded by the lower layers. */
+		if (new_len != l3_len) {
+			int diff = (int)new_len - (int)l3_len;
+			if (diff > 0)
+				msgb_put(msg, diff);
+			else
+				msgb_trim(msg, msgb_length(msg) + diff);
+		}
 
 		LOGP(DLGLOBAL, LOGL_NOTICE,
-		     "fuzzer_hook: [%s] mutated %u → %u bytes (avail=%u)\n",
-		     state_tag, (unsigned)msg->len, use, avail);
-	} else {
-		/* Zero-length response = pass-through (no mutation this round) */
-		LOGP(DLGLOBAL, LOGL_DEBUG,
-		     "fuzzer_hook: [%s] pass-through (zero-length response)\n",
-		     state_tag);
+		     "fuzzer_hook: FUZZED %s (0x%02x) %u→%u bytes [%lu/%lu]\n",
+		     mm_msg_name(msg_type), msg_type,
+		     l3_len, new_len,
+		     g_total_fuzzed, g_total_msgs);
 	}
 
-out:
-	pthread_mutex_unlock(&g_lock);
-	return rc;
+	return 0;
 }
